@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <pwd.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,17 +19,32 @@
 
 #define HAS_FLAG(flags, f) ((flags) & (f))
 
+uint8_t num_width(size_t value);
 int list(const char *path, int flags);
 int cmp_name(const void *, const void *);
 int get_entries(DIR *dirp, int flags, struct dirent ***entries,
                 size_t *entries_count);
-int get_entries_stats(DIR *dirp, struct dirent **entries, size_t entries_count,
-                      struct stat **entries_stats);
+int get_stats(DIR *dirp, struct dirent **entries, size_t entries_count,
+              struct stat **entries_stats);
 int list_dir(const char *path, int flags);
-void list_long(struct stat *st, const char *file_name);
+void list_long(struct stat *st, const char *file_name, uint8_t max_col_nlink,
+               uint8_t max_col_size);
 static char *format_file_mode(mode_t st_mode);
 static char *format_time(struct tm *tm);
 int list_dir_entries(const char *path, int flags);
+
+struct stats_meta {
+  uint8_t link_col_width;
+  uint8_t size_col_width;
+  uint8_t usr_col_width;
+  uint8_t grp_col_width;
+};
+
+#define GET_LINK_COL_WIDTH(stats)                                              \
+  ((struct stats_meta *)(stats) - 1)->link_col_width
+
+#define GET_SIZE_COL_WIDTH(stats)                                              \
+  ((struct stats_meta *)(stats) - 1)->size_col_width
 
 int main(int argc, char *argv[]) {
 
@@ -106,7 +122,7 @@ int list_dir(const char *path, int flags) {
     return -1;
   }
 
-  list_long(&st, path);
+  list_long(&st, path, 5, 5);
   return 0;
 }
 
@@ -134,11 +150,15 @@ int list_dir_entries(const char *path, int flags) {
     }
   } else {
     struct stat *entries_stats;
-    if (get_entries_stats(dirp, entries, entries_count, &entries_stats) == -1)
+    if (get_stats(dirp, entries, entries_count, &entries_stats) == -1)
       return -1;
 
+    uint8_t nlink_col_width = GET_LINK_COL_WIDTH(entries_stats);
+    uint8_t size_col_width = GET_SIZE_COL_WIDTH(entries_stats);
+
     for (size_t i = 0; i < entries_count; i++) {
-      list_long(&entries_stats[i], entries[i]->d_name);
+      list_long(&entries_stats[i], entries[i]->d_name, nlink_col_width,
+                size_col_width);
     }
   }
 
@@ -146,27 +166,40 @@ int list_dir_entries(const char *path, int flags) {
   return 0;
 }
 
-int get_entries_stats(DIR *dirp, struct dirent **entries, size_t entries_count,
-                      struct stat **entries_stats) {
-  struct stat *tmp_entries_stats =
-      malloc(sizeof(*tmp_entries_stats) * entries_count);
-  if (tmp_entries_stats == NULL) {
-    fprintf(stderr, "Error in get_entries_stats(): malloc: %s\n",
-            strerror(errno));
-    return -1;
-  }
+int get_stats(DIR *dirp, struct dirent **entries, size_t count,
+              struct stat **stats) {
+
+  struct stats_meta *meta =
+      malloc(sizeof(struct stats_meta) + (sizeof(**stats) * count));
+
+  if (meta == NULL)
+    return 1;
+
+  __nlink_t max_nlink = 0;
+  __off_t max_size = 0;
+  size_t max_usr = 0;
+  size_t max_grp = 0;
+
+  struct stat *tmp = (struct stat *)(meta + 1);
 
   int fd = dirfd(dirp);
-  for (size_t i = 0; i < entries_count; i++) {
-    if (fstatat(fd, entries[i]->d_name, &tmp_entries_stats[i], 0) == -1) {
-      fprintf(stderr, "Error in get_entries_stats(): fstatat: %s\n",
-              strerror(errno));
-      free(tmp_entries_stats);
+  for (size_t i = 0; i < count; i++) {
+    if (fstatat(fd, entries[i]->d_name, &tmp[i], 0) == -1) {
+      free(meta);
       return -1;
     }
+
+    if (tmp[i].st_nlink > max_nlink)
+      max_nlink = tmp[i].st_nlink;
+
+    if (tmp[i].st_size > max_size)
+      max_size = tmp[i].st_size;
   }
 
-  *entries_stats = tmp_entries_stats;
+  meta->link_col_width = num_width(max_nlink);
+  meta->size_col_width = num_width(max_size);
+
+  *stats = tmp;
   return 0;
 }
 
@@ -217,10 +250,24 @@ clean_local_entries:
   return -1;
 }
 
-void list_long(struct stat *st, const char *file_name) {
-  printf("%s %lu %s %s %*ld %s %s \n", format_file_mode(st->st_mode),
-         st->st_nlink, getpwuid(st->st_uid)->pw_name,
-         getgrgid(st->st_gid)->gr_name, 5, st->st_size,
+/**
+ * Computes the number of digits of a number.
+ */
+uint8_t num_width(size_t value) {
+  uint8_t width = 1;
+  while (value > 10) {
+    value /= 10;
+    width++;
+  }
+  return width;
+}
+
+void list_long(struct stat *st, const char *file_name, uint8_t nlink_col_width,
+               uint8_t size_col_width) {
+
+  printf("%s %*lu %s %s %*ld %s %s \n", format_file_mode(st->st_mode),
+         nlink_col_width, st->st_nlink, getpwuid(st->st_uid)->pw_name,
+         getgrgid(st->st_gid)->gr_name, size_col_width, st->st_size,
          format_time(localtime(&st->st_mtim.tv_sec)), file_name);
 }
 
@@ -229,7 +276,7 @@ static char *format_time(struct tm *tm) {
                            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
   static char mtime_s[15];
 
-  snprintf(mtime_s, sizeof(mtime_s), "%s %i %i:%02i", months[tm->tm_mon],
+  snprintf(mtime_s, sizeof(mtime_s), "%s %2i %02i:%02i", months[tm->tm_mon],
            tm->tm_mday, tm->tm_hour, tm->tm_min);
   return mtime_s;
 }

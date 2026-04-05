@@ -1,3 +1,5 @@
+#define STB_DS_IMPLEMENTATION
+#include "./stb_ds.h"
 #include <dirent.h>
 #include <errno.h>
 #include <grp.h>
@@ -177,6 +179,7 @@ int get_stats(DIR *dirp, struct dirent **entries, size_t count,
 
   __nlink_t max_nlink = 0;
   __off_t max_size = 0;
+
   size_t max_usr = 0;
   size_t max_grp = 0;
 

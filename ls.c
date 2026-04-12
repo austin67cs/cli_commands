@@ -1,5 +1,4 @@
-#define STB_DS_IMPLEMENTATION
-#include "./stb_ds.h"
+#include "./dynamic_array.h"
 #include <dirent.h>
 #include <errno.h>
 #include <grp.h>
@@ -18,19 +17,16 @@
 #define LS_A (1 << 0) // list all.
 #define LS_L (1 << 1) // list long.
 #define LS_D (1 << 2) // list self.
-
 #define HAS_FLAG(flags, f) ((flags) & (f))
 
+/**
+ * Computes the number of digits in a number.
+ */
 uint8_t num_width(size_t value);
+
 int list(const char *path, int flags);
 int cmp_name(const void *, const void *);
-int get_entries(DIR *dirp, int flags, struct dirent ***entries,
-                size_t *entries_count);
-int get_stats(DIR *dirp, struct dirent **entries, size_t entries_count,
-              struct stat **entries_stats);
 int list_dir(const char *path, int flags);
-void list_long(struct stat *st, const char *file_name, uint8_t max_col_nlink,
-               uint8_t max_col_size);
 static char *format_file_mode(mode_t st_mode);
 static char *format_time(struct tm *tm);
 int list_dir_entries(const char *path, int flags);
@@ -40,13 +36,85 @@ struct stats_meta {
   uint8_t size_col_width;
   uint8_t usr_col_width;
   uint8_t grp_col_width;
+  void *usr_grp_names;
 };
 
-#define GET_LINK_COL_WIDTH(stats)                                              \
-  ((struct stats_meta *)(stats) - 1)->link_col_width
+struct id_name_pair {
+  uint32_t id;
+  char *name;
+};
 
-#define GET_SIZE_COL_WIDTH(stats)                                              \
-  ((struct stats_meta *)(stats) - 1)->size_col_width
+struct d_entry {
+  ino_t d_ino;
+  char *d_name;
+};
+
+void list_long(struct d_entry *entries, struct stat *stats);
+int get_stats(DIR *dirp, struct d_entry *entries, struct stat **entries_stats);
+int get_entries(DIR *dirp, int flags, struct d_entry **entries);
+void free_entries(struct d_entry *entries);
+
+static ssize_t get_usr_name_cache_idx(struct id_name_pair *cache, uint32_t id) {
+  // Stores the most recently accessed cached file user id against its index in
+  // the cache array.
+  static struct {
+    uint32_t id;
+    ssize_t idx;
+  } last = {.idx = -1};
+
+  if (last.idx != -1 && last.id == id)
+    return last.idx;
+
+  size_t length = ARR_LENGTH(cache);
+  for (size_t i = 0; i < length; i++) {
+    if (cache[i].id == id) {
+      last.id = id;
+      last.idx = i;
+      return i;
+    }
+  }
+  return -1;
+}
+
+static ssize_t get_grp_name_cache_idx(struct id_name_pair *cache, uint32_t id) {
+  // Stores the most recently accessed cached file group id against its index in
+  // the cache array.
+  static struct {
+    uint32_t id;
+    ssize_t idx;
+  } last = {.idx = -1};
+
+  if (last.idx != -1 && last.id == id)
+    return last.idx;
+
+  size_t length = ARR_LENGTH(cache);
+  for (size_t i = 0; i < length; i++) {
+    if (cache[i].id == id) {
+      last.id = id;
+      last.idx = i;
+      return i;
+    }
+  }
+  return -1;
+}
+
+#define STATS_HEADER(stats) ((struct stats_meta *)(stats) - 1)
+#define GET_LINK_COL_WIDTH(stats) (STATS_HEADER(stats)->link_col_width)
+#define GET_SIZE_COL_WIDTH(stats) (STATS_HEADER(stats)->size_col_width)
+#define GET_MAX_USR_NAME_LEN(stats) (STATS_HEADER(stats)->usr_col_width)
+#define GET_MAX_GRP_NAME_LEN(stats) (STATS_HEADER(stats)->grp_col_width)
+#define GET_USR_GRP_NAMES(stats) (STATS_HEADER(stats)->usr_grp_names)
+#define SET_MAX_USR_NAME_LEN(stats, n)                                         \
+  (STATS_HEADER(stats)->usr_col_width = (n))
+#define SET_MAX_GRP_NAME_LEN(stats, n)                                         \
+  (STATS_HEADER(stats)->grp_col_width = (n))
+
+static inline void free_usr_grp_names_cache(struct id_name_pair *cache) {
+  size_t length = ARR_LENGTH(cache);
+  for (size_t i = 0; i < length; i++)
+    free(cache[i].name);
+  ARR_FREE(cache);
+}
 
 int main(int argc, char *argv[]) {
 
@@ -101,8 +169,8 @@ int list(const char *path, int flags) {
 }
 
 int cmp_name(const void *a, const void *b) {
-  struct dirent *entry_a = *((struct dirent **)a);
-  struct dirent *entry_b = *((struct dirent **)b);
+  struct d_entry *entry_a = (struct d_entry *)a;
+  struct d_entry *entry_b = (struct d_entry *)b;
 
   return strcmp(entry_a->d_name, entry_b->d_name);
 }
@@ -124,7 +192,7 @@ int list_dir(const char *path, int flags) {
     return -1;
   }
 
-  list_long(&st, path, 5, 5);
+  /* list_long(&st, path, 5, 5); */
   return 0;
 }
 
@@ -137,119 +205,212 @@ int list_dir_entries(const char *path, int flags) {
     return -1;
   }
 
-  struct dirent **entries = NULL;
-  size_t entries_count = 0;
+  struct d_entry *entries = NULL;
 
-  if (get_entries(dirp, flags, &entries, &entries_count) == -1) {
+  if (get_entries(dirp, flags, &entries) == -1) {
     perror("get_entries");
+    closedir(dirp);
     return -1;
   }
+  size_t entries_count = ARR_LENGTH(entries);
   qsort(entries, entries_count, sizeof(*entries), cmp_name);
 
   if (!HAS_FLAG(flags, LS_L)) {
     for (size_t i = 0; i < entries_count; i++) {
-      printf("%s ", entries[i]->d_name);
+      printf("%s ", entries[i].d_name);
     }
   } else {
     struct stat *entries_stats;
-    if (get_stats(dirp, entries, entries_count, &entries_stats) == -1)
+    if (get_stats(dirp, entries, &entries_stats) == -1) {
+      closedir(dirp);
       return -1;
+    }
 
     uint8_t nlink_col_width = GET_LINK_COL_WIDTH(entries_stats);
     uint8_t size_col_width = GET_SIZE_COL_WIDTH(entries_stats);
 
-    for (size_t i = 0; i < entries_count; i++) {
-      list_long(&entries_stats[i], entries[i]->d_name, nlink_col_width,
-                size_col_width);
-    }
+    list_long(entries, entries_stats);
+    struct stats_meta *stats_meta = STATS_HEADER(entries_stats);
+
+    free_usr_grp_names_cache(stats_meta->usr_grp_names);
+
+    // Free stats from its meta.
+    free(stats_meta);
   }
 
+  free_entries(entries);
   closedir(dirp);
   return 0;
 }
 
-int get_stats(DIR *dirp, struct dirent **entries, size_t count,
-              struct stat **stats) {
+int get_stats(DIR *dirp, struct d_entry *entries, struct stat **stats) {
 
-  struct stats_meta *meta =
-      malloc(sizeof(struct stats_meta) + (sizeof(**stats) * count));
+  size_t entries_count = ARR_LENGTH(entries);
 
-  if (meta == NULL)
+  // Memory allocation to hold the file stats retrieved and its metadata.
+  struct stats_meta *stats_meta =
+      malloc(sizeof(struct stats_meta) + (sizeof(**stats) * entries_count));
+  if (stats_meta == NULL)
     return 1;
+
+  // Actual memory where retrieved stats live.
+  struct stat *local_stats = (struct stat *)(stats_meta + 1);
+
+  // Memory allocation to cache file owner name and file group name to reduce
+  // system call.
+  struct arr_meta *usr_grp_names_cache_meta =
+      malloc(sizeof(struct arr_meta) +
+             (sizeof(struct id_name_pair) * ARR_INIT_CAPACITY));
+  if (usr_grp_names_cache_meta == NULL)
+    return -1;
+
+  // Actual allocation where cache values live.
+  struct id_name_pair *usr_grp_names_cache =
+      (struct id_name_pair *)(usr_grp_names_cache_meta + 1);
+
+  // Initialization of metadata.
+  ARR_SET_CAPACITY(usr_grp_names_cache, ARR_INIT_CAPACITY);
+  ARR_SET_LENGTH(usr_grp_names_cache, 0);
 
   __nlink_t max_nlink = 0;
   __off_t max_size = 0;
 
-  size_t max_usr = 0;
-  size_t max_grp = 0;
-
-  struct stat *tmp = (struct stat *)(meta + 1);
+  // Initialization of metadata.
+  SET_MAX_USR_NAME_LEN(local_stats, 0);
+  SET_MAX_GRP_NAME_LEN(local_stats, 0);
 
   int fd = dirfd(dirp);
-  for (size_t i = 0; i < count; i++) {
-    if (fstatat(fd, entries[i]->d_name, &tmp[i], 0) == -1) {
-      free(meta);
+  for (size_t i = 0; i < entries_count; i++) {
+    int8_t state = fstatat(fd, entries[i].d_name, &local_stats[i], 0);
+
+    if (state == -1) {
+      free(stats_meta);
       return -1;
     }
 
-    if (tmp[i].st_nlink > max_nlink)
-      max_nlink = tmp[i].st_nlink;
+    size_t cache_length = ARR_LENGTH(usr_grp_names_cache);
 
-    if (tmp[i].st_size > max_size)
-      max_size = tmp[i].st_size;
+    if (cache_length == 0 ||
+        get_usr_name_cache_idx(usr_grp_names_cache, local_stats[i].st_uid) ==
+            -1) {
+
+      struct passwd *passwd = getpwuid(local_stats[i].st_uid);
+      if (passwd == NULL)
+        return -1;
+
+      char *file_usr_name = passwd->pw_name;
+      if (cache_length == ARR_CAPACITY(usr_grp_names_cache)) {
+
+        size_t new_capacity = ARR_NEW_CAPACITY(usr_grp_names_cache);
+        void *state = ARR_RESIZE(usr_grp_names_cache, new_capacity);
+
+        if (state == NULL)
+          // TODO: Try implementing a fall through such that if caching fails
+          // program still continues and retrieve file user name and file group
+          // name one file at a time. But this would mean potential wasteful
+          // system calls.
+          return -1;
+      }
+
+      usr_grp_names_cache[cache_length].id = local_stats[i].st_uid;
+      usr_grp_names_cache[cache_length].name = strdup(file_usr_name);
+
+      cache_length++;
+      ARR_SET_LENGTH(usr_grp_names_cache, cache_length);
+
+      size_t file_usr_name_len = strlen(file_usr_name);
+
+      if (file_usr_name_len > GET_MAX_USR_NAME_LEN(local_stats))
+        SET_MAX_USR_NAME_LEN(local_stats, file_usr_name_len);
+    }
+
+    if (cache_length == 0 ||
+        get_grp_name_cache_idx(usr_grp_names_cache, local_stats[i].st_gid) ==
+            -1) {
+
+      struct group *group = getgrgid(local_stats[i].st_gid);
+      if (group == NULL)
+        return -1;
+
+      char *file_grp_name = group->gr_name;
+      if (cache_length == ARR_CAPACITY(usr_grp_names_cache)) {
+
+        size_t new_capacity = ARR_NEW_CAPACITY(usr_grp_names_cache);
+        void *status = ARR_RESIZE(usr_grp_names_cache, new_capacity);
+
+        if (status == NULL)
+          // TODO: Try implementing a fall through such that if caching fails
+          // program still continues and retrieve file user name and file group
+          // name one file at a time. But this would mean potential wasteful
+          // system calls.
+          return -1;
+      }
+
+      usr_grp_names_cache[cache_length].id = local_stats[i].st_gid;
+      usr_grp_names_cache[cache_length].name = strdup(file_grp_name);
+
+      cache_length++;
+      ARR_SET_LENGTH(usr_grp_names_cache, cache_length);
+
+      size_t file_grp_name_len = strlen(file_grp_name);
+
+      if (file_grp_name_len > GET_MAX_GRP_NAME_LEN(local_stats))
+        SET_MAX_GRP_NAME_LEN(local_stats, file_grp_name_len);
+    }
+
+    if (local_stats[i].st_nlink > max_nlink)
+      max_nlink = local_stats[i].st_nlink;
+
+    if (local_stats[i].st_size > max_size)
+      max_size = local_stats[i].st_size;
   }
 
-  meta->link_col_width = num_width(max_nlink);
-  meta->size_col_width = num_width(max_size);
+  // Check if maximum group name length is zero in which the file user name and
+  // the file group name are the same for each file.
+  if (GET_MAX_GRP_NAME_LEN(local_stats) == 0)
+    SET_MAX_GRP_NAME_LEN(local_stats, GET_MAX_USR_NAME_LEN(local_stats));
 
-  *stats = tmp;
+  stats_meta->link_col_width = num_width(max_nlink);
+  stats_meta->size_col_width = num_width(max_size);
+  stats_meta->usr_grp_names = usr_grp_names_cache;
+
+  *stats = local_stats;
   return 0;
 }
 
-/**
- * Writes into the entries and entries_count variables the directory entries
- * retrieved. Does not modify entries or entries_count on Failure. Returns -1 on
- * failure and 0 on success.
- */
-int get_entries(DIR *dirp, int flags, struct dirent ***entries,
-                size_t *entries_count) {
+int get_entries(DIR *dirp, int flags, struct d_entry **entries) {
+
   struct dirent *entry = NULL;
-  struct dirent **local_entries = NULL;
-  size_t local_entries_count = 0;
+  struct d_entry *lentries = NULL;
 
   while ((entry = readdir(dirp)) != NULL) {
     if (!HAS_FLAG(flags, LS_A) && entry->d_name[0] == '.')
       continue;
 
-    // Resize the list of entries to accomodate new entry.
-    void *tmp_local_entries = realloc(
-        local_entries, (local_entries_count + 1) * sizeof(*local_entries));
+    size_t length = ARR_LENGTH(lentries);
 
-    if (tmp_local_entries == NULL)
-      goto clean_local_entries;
+    if (length == ARR_CAPACITY(lentries)) {
+      size_t new_capacity = ARR_NEW_CAPACITY(lentries);
 
-    local_entries = tmp_local_entries;
+      struct arr_meta *meta = ARR_RESIZE(lentries, new_capacity);
+      if (meta == NULL)
+        goto clean_lentries;
 
-    // Local pointer variable to hold a copy of the entry.
-    void *local_entry = malloc(entry->d_reclen);
+      meta->capacity = new_capacity;
+      lentries = (struct d_entry *)(meta + 1);
+    }
 
-    if (local_entry == NULL)
-      goto clean_local_entries;
+    memcpy(&lentries[length].d_ino, &entry->d_ino, sizeof(entry->d_ino));
+    lentries[length].d_name = strdup(entry->d_name);
 
-    local_entries[local_entries_count] = local_entry;
-    memcpy(local_entries[local_entries_count], entry, entry->d_reclen);
-    local_entries_count++;
+    ARR_SET_LENGTH(lentries, length + 1);
   }
 
-  *entries = local_entries;
-  *entries_count = local_entries_count;
+  *entries = lentries;
   return 0;
 
-clean_local_entries:
-  for (size_t i = 0; i < local_entries_count; i++) {
-    free(local_entries[i]);
-  }
-  free(local_entries);
+clean_lentries:
+  free_entries(lentries);
   return -1;
 }
 
@@ -265,13 +426,29 @@ uint8_t num_width(size_t value) {
   return width;
 }
 
-void list_long(struct stat *st, const char *file_name, uint8_t nlink_col_width,
-               uint8_t size_col_width) {
+void list_long(struct d_entry *entries, struct stat *stats) {
 
-  printf("%s %*lu %s %s %*ld %s %s \n", format_file_mode(st->st_mode),
-         nlink_col_width, st->st_nlink, getpwuid(st->st_uid)->pw_name,
-         getgrgid(st->st_gid)->gr_name, size_col_width, st->st_size,
-         format_time(localtime(&st->st_mtim.tv_sec)), file_name);
+  /* struct stat *st, const char *file_name, uint8_t nlink_col_width,
+                 uint8_t size_col_width */
+
+  size_t length = ARR_LENGTH(entries);
+  struct id_name_pair *usr_grp_names = GET_USR_GRP_NAMES(stats);
+
+  for (size_t i = 0; i < length; i++) {
+
+    struct stat st = stats[i];
+
+    char *usr_name =
+        usr_grp_names[get_usr_name_cache_idx(usr_grp_names, st.st_uid)].name;
+    char *grp_name =
+        usr_grp_names[get_grp_name_cache_idx(usr_grp_names, st.st_gid)].name;
+
+    printf("%s %*lu %*s %-*s %*ld %s %s \n", format_file_mode(st.st_mode),
+           GET_LINK_COL_WIDTH(stats), st.st_nlink, GET_MAX_USR_NAME_LEN(stats),
+           usr_name, GET_MAX_GRP_NAME_LEN(stats), grp_name,
+           GET_SIZE_COL_WIDTH(stats), st.st_size,
+           format_time(localtime(&st.st_mtim.tv_sec)), entries[i].d_name);
+  }
 }
 
 static char *format_time(struct tm *tm) {
@@ -298,4 +475,12 @@ static char *format_file_mode(mode_t st_mode) {
   }
 
   return mode;
+}
+
+inline void free_entries(struct d_entry *entries) {
+  size_t count = ARR_LENGTH(entries);
+  for (size_t i = 0; i < count; i++)
+    free(entries[i].d_name);
+
+  ARR_FREE(entries);
 }
